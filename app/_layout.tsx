@@ -7,6 +7,7 @@ import { useEffect } from 'react';
 import 'react-native-reanimated';
 
 import { useColorScheme } from '@/components/useColorScheme';
+import { EngineProvider } from '@/src/lib/engine';
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -41,7 +42,11 @@ export default function RootLayout() {
     return null;
   }
 
-  return <RootLayoutNav />;
+  return (
+    <EngineProvider>
+      <RootLayoutNav />
+    </EngineProvider>
+  );
 }
 
 function RootLayoutNav() {

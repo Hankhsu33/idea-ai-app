@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>BGone inference engine</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: #4c8dff;
+        font: 10px/1.4 ui-monospace, Menlo, monospace;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      BGone inference engine.
+
+      This page is bundled with the app (assets/webview/inference.html) and injected into a
+      react-native-webview via `source={{ html, baseUrl }}`. It never loads anything from the
+      network: every byte it needs (the Transformers.js bundle, the onnxruntime-web wasm, and
+      the RMBG-1.4 weights) is streamed in from React Native, which reads them from files the
+      app owns in its document directory.
+
+      Protocol, RN -> page (all delivered through injectJavaScript, never MessageEvent, so the
+      iOS/Android differences in postMessage delivery are irrelevant):
+        window.__BGONE_RECV(jsonString)                  control messages
+        window.__BGONE_CHUNK(requestId, index, base64)   bulk file bytes
+
+      Protocol, page -> RN (window.ReactNativeWebView.postMessage, JSON):
+        ready | fileRequest | progress | runtime | warmed | result | resultChunk | pong | error | log
+    -->
+    <script>
+      (function () {
+        'use strict';
+
+        /* ----------------------------------------------------------------- *
+         * Transport
+         * ----------------------------------------------------------------- */
+
+        var RN = window.ReactNativeWebView;
+        var seq = 0;
+
+        function nextId(prefix) {
+          return prefix + ++seq;
+        }
+
+        function send(type, payload, id) {
+          if (!RN) return;
+          try {
+            RN.postMessage(JSON.stringify({ id: id || nextId('m'), type: type, payload: payload }));
+          } catch (e) {
+            /* the bridge is the only way out; if it is gone there is nothing to report to */
+          }
+        }
+
+        function log(line) {
+          send('log', { line: String(line) });
+        }
+
+        function fail(message, fatal) {
+          send('error', { message: String(message && message.message ? message.message : message), fatal: !!fatal });
+        }
+
+        function progress(stage, ratio, detail) {
+          send('progress', { stage: stage, ratio: ratio, detail: detail });
+        }
+
+        window.onerror = function (message, source, line) {
+          fail('page error: ' + message + ' @' + line, true);
+          return false;
+        };
+        window.onunhandledrejection = function (event) {
+          var r = event && event.reason;
+          fail('unhandled rejection: ' + ((r && r.message) || r), true);
+        };
+
+        /* ----------------------------------------------------------------- *
+         * base64
+         * ----------------------------------------------------------------- */
+
+        var HAS_NATIVE_B64 = typeof Uint8Array.fromBase64 === 'function';
+
+        function b64decode(s) {
+          if (HAS_NATIVE_B64) return Uint8Array.fromBase64(s);
+          var bin = atob(s);
+          var n = bin.length;
+          var out = new Uint8Array(n);
+          for (var i = 0; i < n; i++) out[i] = bin.charCodeAt(i);
+          return out;
+        }
+
+        /* ----------------------------------------------------------------- *
+         * File transfer: the page asks RN for bytes by file name.
+         *
+         * RN answers with one `fileMeta` control message (so we can allocate the
+         * destination buffer exactly once) followed by N __BGONE_CHUNK calls.
+         * ----------------------------------------------------------------- */
+
+        var CONTENT_TYPES = {
+          js: 'text/javascript',
+          mjs: 'text/javascript',
+          wasm: 'application/wasm',
+          onnx: 'application/octet-stream',
+          json: 'application/json',
+        };
+
+        /** requestId -> in-flight transfer record */
+        var transfers = new Map();
+        /** file name -> Promise<Uint8Array>, so two concurrent loaders share one transfer */
+        var inflight = new Map();
+
+        /**
+         * file name -> Uint8Array, for small files only.
+         *
+         * The weights and the WebAssembly binary are deliberately NOT retained: model
+         * loading already peaks at several copies of them (transfer buffer, Response
+         * body, the reader's own buffer, the session), and holding one more purely to
+         * speed up a rare WebGPU-to-WASM retry is the wrong trade on a phone. Neither
+         * is re-requested in practice — ORT keeps the wasm binary itself once loaded.
+         */
+        var CACHEABLE_MAX_BYTES = 8 * 1024 * 1024;
+        var byteCache = new Map();
+
+        /* --------------------------------------------------------------- *
+         * Cache Storage: an optimisation, never a source of truth.
+         *
+         * The files on disk remain authoritative. This only saves pushing ~55 MB
+         * across the bridge on every launch. Every operation is wrapped so that a
+         * missing, full, evicted or simply broken cache degrades to exactly the
+         * behaviour we had before it existed.
+         *
+         * A hit is only trusted when its byte length matches the size RN reported for
+         * that file, so an evicted-mid-write or stale entry can never reach the model.
+         * --------------------------------------------------------------- */
+
+        var CACHE_NAME = 'bgone-files-v1';
+        var cacheAvailable = typeof caches !== 'undefined';
+        /** name -> expected byte length, sent by RN with the warm request. */
+        var fileManifest = {};
+
+        function cacheKey(name) {
+          return '/cached/' + name;
+        }
+
+        async function loadFromCache(name) {
+          if (!cacheAvailable) return null;
+
+          var expected = fileManifest[name];
+          // Without an expected size there is no way to validate a hit, so don't risk it.
+          if (!expected) return null;
+
+          try {
+            var store = await caches.open(CACHE_NAME);
+            var hit = await store.match(cacheKey(name));
+            if (!hit) return null;
+
+            var bytes = new Uint8Array(await hit.arrayBuffer());
+            if (bytes.length !== expected) {
+              log('cache entry for ' + name + ' is the wrong size, dropping it');
+              try {
+                await store.delete(cacheKey(name));
+              } catch (e) {
+                /* nothing to do */
+              }
+              return null;
+            }
+            return bytes;
+          } catch (e) {
+            log('cache read failed for ' + name + ': ' + e.message);
+            return null;
+          }
+        }
+
+        function saveToCache(name, bytes) {
+          if (!cacheAvailable) return;
+          caches
+            .open(CACHE_NAME)
+            .then(function (store) {
+              return store.put(
+                cacheKey(name),
+                new Response(bytes, { headers: { 'Content-Length': String(bytes.length) } })
+              );
+            })
+            .catch(function (e) {
+              // Quota exhaustion lands here. Not fatal: next launch just uses the bridge.
+              log('cache write failed for ' + name + ': ' + e.message);
+            });
+        }
+
+        function baseName(url) {
+          var s = String(url).split('?')[0].split('#')[0];
+          var parts = s.split('/');
+          return parts[parts.length - 1];
+        }
+
+        function contentTypeFor(name) {
+          var ext = name.indexOf('.') >= 0 ? name.split('.').pop().toLowerCase() : '';
+          return CONTENT_TYPES[ext] || 'application/octet-stream';
+        }
+
+        function transferFromRN(name, url) {
+          return new Promise(function (resolve, reject) {
+            var requestId = nextId('f');
+            transfers.set(requestId, {
+              name: name,
+              resolve: resolve,
+              reject: reject,
+              buf: null,
+              size: 0,
+              received: 0,
+            });
+            send('fileRequest', { requestId: requestId, name: name, url: String(url) }, requestId);
+          });
+        }
+
+        function requestBytes(url) {
+          var name = baseName(url);
+
+          var cached = byteCache.get(name);
+          if (cached) return Promise.resolve(cached);
+
+          var pending = inflight.get(name);
+          if (pending) return pending;
+
+          var promise = loadFromCache(name).then(function (hit) {
+            if (hit) {
+              progress('transfer', 1, name + ' from cache');
+              log('cache HIT  ' + name + ' (' + (hit.length / 1048576).toFixed(1) + ' MB, no bridge)');
+              return hit;
+            }
+            log('cache MISS ' + name + ' — transferring over the bridge');
+            return transferFromRN(name, url).then(function (bytes) {
+              saveToCache(name, bytes);
+              return bytes;
+            });
+          });
+
+          promise.then(
+            function (bytes) {
+              // Deliberately NOT deleted from `inflight` on success: Transformers.js
+              // asks for the weights more than once (metadata, then content), and the
+              // resolved promise is what makes the second ask free. Without this the
+              // 42 MB file was fetched — and, on a cache miss, bridged — twice.
+              // Both maps are emptied once the session owns the bytes.
+              if (bytes.length <= CACHEABLE_MAX_BYTES) byteCache.set(name, bytes);
+            },
+            function () {
+              // A failure must not be sticky; the next attempt has to be able to retry.
+              inflight.delete(name);
+            }
+          );
+
+          inflight.set(name, promise);
+          return promise;
+        }
+
+        function onFileMeta(p) {
+          var t = transfers.get(p.requestId);
+          if (!t) return;
+          t.size = p.size;
+          try {
+            t.buf = new Uint8Array(p.size);
+          } catch (e) {
+            transfers.delete(p.requestId);
+            t.reject(new Error('out of memory allocating ' + p.size + ' bytes for ' + t.name));
+          }
+        }
+
+        function onFileError(p) {
+          var t = transfers.get(p.requestId);
+          if (!t) return;
+          transfers.delete(p.requestId);
+          t.reject(new Error(p.message || ('could not read ' + t.name)));
+        }
+
+        // `offset` is the absolute byte position, not a chunk index: the reader on the
+        // RN side is free to hand back a short read without knocking the file askew.
+        window.__BGONE_CHUNK = function (requestId, offset, b64) {
+          var t = transfers.get(requestId);
+          if (!t || !t.buf) return;
+          try {
+            var bytes = b64decode(b64);
+            t.buf.set(bytes, offset);
+            t.received += bytes.length;
+          } catch (e) {
+            transfers.delete(requestId);
+            t.reject(new Error('chunk decode failed for ' + t.name + ': ' + e.message));
+            return;
+          }
+
+          progress(
+            'transfer',
+            t.size ? t.received / t.size : null,
+            t.name + ' ' + (t.received / 1048576).toFixed(1) + '/' + (t.size / 1048576).toFixed(1) + ' MB'
+          );
+
+          if (t.received >= t.size) {
+            transfers.delete(requestId);
+            t.resolve(t.buf);
+          }
+        };
+
+        /* ----------------------------------------------------------------- *
+         * Engine
+         * ----------------------------------------------------------------- */
+
+        var T = null; // the Transformers.js module namespace
+        var model = null;
+        var processor = null;
+        var backend = null; // 'webgpu' | 'wasm'
+        var busy = false; // guards against overlapping jobs inside the page
+        var warmPromise = null;
+        /** True only when the loaded onnxruntime build actually contains WebGPU support. */
+        var wasmBuildHasWebGpu = false;
+        /** Square edge the model actually runs at. Lower is quadratically faster. */
+        var currentSize = 1024;
+
+        /**
+         * The single point where Transformers.js reaches for bytes. Model weights, the
+         * onnxruntime wasm binary and the wasm factory .mjs all funnel through here
+         * (see transformers.js src/utils/hub.js getFile and
+         * src/backends/utils/cacheWasm.js loadAndCacheFile).
+         */
+        function shimFetch(input) {
+          var url = typeof input === 'string' ? input : input && input.url ? input.url : String(input);
+
+          // data: and blob: are in-memory, not network. Transformers.js routes
+          // RawImage.fromURL through env.fetch too, so these have to pass through or
+          // image decoding would be answered with a 404 from the model file server.
+          if (url.indexOf('data:') === 0 || url.indexOf('blob:') === 0) {
+            return fetch(url);
+          }
+
+          return requestBytes(url).then(
+            function (bytes) {
+              return new Response(bytes, {
+                status: 200,
+                headers: {
+                  'Content-Type': contentTypeFor(baseName(url)),
+                  'Content-Length': String(bytes.byteLength),
+                },
+              });
+            },
+            function (e) {
+              log('offline fetch miss: ' + url + ' :: ' + e.message);
+              return new Response(null, { status: 404, statusText: 'not available offline' });
+            }
+          );
+        }
+
+        async function loadLibrary() {
+          progress('compile', null, 'loading runtime');
+          var bytes = await requestBytes('transformers.min.js');
+          var code = new TextDecoder('utf-8').decode(bytes);
+          var url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+          try {
+            return await import(url);
+          } finally {
+            // The module graph is retained by the import; the blob URL is not needed after.
+            URL.revokeObjectURL(url);
+          }
+        }
+
+        function configureEnv() {
+          var env = T.env;
+
+          // Never resolve a remote URL. Combined with the fetch shim below this makes a
+          // network call impossible rather than merely unlikely.
+          env.allowLocalModels = true;
+          env.allowRemoteModels = false;
+          env.localModelPath = '/models/';
+
+          // We own the bytes on disk, so every in-browser cache is dead weight.
+          env.useBrowserCache = false;
+          env.useCustomCache = false;
+          env.useFSCache = false;
+
+          // Must stay true: it is what routes the onnxruntime wasm binary and its .mjs
+          // factory through env.fetch instead of letting ORT fetch/import them directly.
+          env.useWasmCache = true;
+
+          env.fetch = shimFetch;
+
+          var onnx = env.backends && env.backends.onnx;
+          if (onnx && onnx.wasm) {
+            // No SharedArrayBuffer in a WebView (the page is not cross-origin isolated),
+            // so ask for a single thread instead of letting ORT try to spawn workers.
+            onnx.wasm.numThreads = 1;
+            onnx.wasm.proxy = false;
+          }
+
+          // Whether WebGPU is even reachable is decided by WHICH wasm build
+          // Transformers.js picked, not by navigator.gpu.
+          //
+          // src/backends/onnx.js picks the plain SIMD build for Safari and the asyncify
+          // build for everything else. Only the asyncify build carries the WebGPU glue;
+          // the plain one has no `webgpuInit`, so asking for the webgpu execution
+          // provider there throws — and, fatally, that throw poisons ORT's one-shot
+          // backend initialisation, so a WASM retry in the same page fails too.
+          //
+          // An iOS WebView reports navigator.gpu but gets the Safari build, which is
+          // exactly the combination that used to brick start-up.
+          var paths = onnx && onnx.wasm ? onnx.wasm.wasmPaths : null;
+          wasmBuildHasWebGpu =
+            !!paths && typeof paths === 'object' && /asyncify/.test(String(paths.mjs || ''));
+
+          send('runtime', {
+            transformers: env.version,
+            ort: onnx && onnx.versions ? onnx.versions.web : null,
+            wasmPaths: onnx && onnx.wasm ? onnx.wasm.wasmPaths : null,
+          });
+        }
+
+        async function probeWebGPU() {
+          if (!navigator.gpu || typeof navigator.gpu.requestAdapter !== 'function') return false;
+          try {
+            var adapter = await Promise.race([
+              navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }),
+              new Promise(function (r) {
+                setTimeout(function () {
+                  r(null);
+                }, 4000);
+              }),
+            ]);
+            return !!adapter;
+          } catch (e) {
+            log('webgpu probe threw: ' + e.message);
+            return false;
+          }
+        }
+
+        function onProgressCallback(data) {
+          if (!data) return;
+          if (data.status === 'progress' && data.total) {
+            progress('compile', data.loaded / data.total, (data.file || '') + ' decoding');
+          } else if (data.status === 'ready' || data.status === 'done') {
+            progress('compile', 1, data.file || 'ready');
+          }
+        }
+
+        /**
+         * dtype is pinned to q8 on both devices on purpose: it is the same
+         * onnx/model_quantized.onnx file either way, so falling back from WebGPU to WASM
+         * costs nothing and never needs a different download.
+         */
+        /**
+         * The processor is pure configuration — `from_pretrained` with an inline config
+         * fetches nothing. That is what makes changing the working resolution cheap:
+         * rebuild this, keep the session.
+         *
+         * RMBG-1.4's ONNX graph has symbolic spatial axes (dim_params, not fixed 1024),
+         * so any size the U-net can halve six times works. Keep it a multiple of 32.
+         */
+        function buildProcessor(size) {
+          return T.AutoProcessor.from_pretrained('briaai/RMBG-1.4', {
+            config: {
+              do_normalize: true,
+              do_pad: false,
+              do_rescale: true,
+              do_resize: true,
+              image_mean: [0.5, 0.5, 0.5],
+              feature_extractor_type: 'ImageFeatureExtractor',
+              image_std: [1, 1, 1],
+              resample: 2,
+              rescale_factor: 0.00392156862745098,
+              size: { width: size, height: size },
+            },
+            progress_callback: onProgressCallback,
+          });
+        }
+
+        async function loadFor(device) {
+          var m = await T.AutoModel.from_pretrained('briaai/RMBG-1.4', {
+            // RMBG-1.4's config.json declares an architecture Transformers.js does not know,
+            // so the official recipe overrides model_type instead of reading it.
+            config: { model_type: 'custom' },
+            device: device,
+            dtype: 'q8',
+            progress_callback: onProgressCallback,
+          });
+          var p = await buildProcessor(currentSize);
+          return { model: m, processor: p };
+        }
+
+        async function setResolution(size) {
+          if (!T) {
+            currentSize = size;
+            return;
+          }
+          currentSize = size;
+          processor = await buildProcessor(size);
+          log('working resolution is now ' + size);
+        }
+
+        /** One tiny synthetic image through the full path, so the first real tap is fast. */
+        async function warmUp() {
+          var w = 32;
+          var h = 32;
+          var data = new Uint8ClampedArray(w * h * 3);
+          for (var i = 0; i < w * h; i++) {
+            var x = i % w;
+            var y = (i / w) | 0;
+            var inside = (x - 16) * (x - 16) + (y - 16) * (y - 16) < 100;
+            data[i * 3] = inside ? 220 : 20;
+            data[i * 3 + 1] = inside ? 180 : 20;
+            data[i * 3 + 2] = inside ? 140 : 20;
+          }
+          var image = new T.RawImage(data, w, h, 3);
+          var inputs = await processor(image);
+          await model({ input: inputs.pixel_values });
+        }
+
+        /** Raised to ask RN for a fresh page that skips WebGPU entirely. */
+        function NeedsWasmRestart(message) {
+          this.name = 'NeedsWasmRestart';
+          this.message = message;
+        }
+        NeedsWasmRestart.prototype = Object.create(Error.prototype);
+
+        async function warm(options) {
+          if (warmPromise) return warmPromise;
+          var forceWasm = !!(options && options.forceWasm);
+          if (options && options.manifest) fileManifest = options.manifest;
+          if (options && options.size) currentSize = options.size;
+          warmPromise = (async function () {
+            var started = Date.now();
+
+            T = await loadLibrary();
+            configureEnv();
+
+            var wantsGpu = !forceWasm && wasmBuildHasWebGpu && (await probeWebGPU());
+            var loaded = null;
+
+            if (wantsGpu) {
+              try {
+                progress('compile', null, 'initialising webgpu');
+                loaded = await loadFor('webgpu');
+                backend = 'webgpu';
+              } catch (e) {
+                // Do NOT try WASM here. ORT caches its backend initialisation, and a
+                // failed WebGPU init leaves that cache rejected — every later attempt in
+                // this page returns the same "no available backend found". The only
+                // clean recovery is a brand new page, which RN gives us.
+                log('webgpu init failed, asking for a wasm-only restart: ' + e.message);
+                throw new NeedsWasmRestart(e && e.message ? e.message : String(e));
+              }
+            }
+
+            if (!loaded) {
+              progress('compile', null, 'initialising wasm');
+              loaded = await loadFor('wasm');
+              backend = 'wasm';
+            }
+
+            model = loaded.model;
+            processor = loaded.processor;
+
+            // The session owns its own copy of the weights now. Released before the
+            // warm-up run so peak memory is session + activations, not session +
+            // activations + a spare 44 MB.
+            byteCache.clear();
+            inflight.clear();
+
+            progress('infer', null, 'warming up');
+            await warmUp();
+
+            send('warmed', { backend: backend, ms: Date.now() - started });
+          })();
+
+          warmPromise.catch(function (e) {
+            warmPromise = null;
+            if (e instanceof NeedsWasmRestart) {
+              // Not a failure the user needs to see: RN will hand us a fresh page with
+              // WebGPU switched off and start-up continues from there.
+              send('needsWasmRestart', { reason: e.message });
+              return;
+            }
+            fail('engine init failed: ' + (e && e.message ? e.message : e), true);
+          });
+
+          return warmPromise;
+        }
+
+        var RESULT_CHUNK = 512 * 1024;
+
+        async function process(jobId, imageBase64, mimeType) {
+          if (!model || !processor) {
+            send('error', { message: 'engine is not ready', fatal: false }, jobId);
+            return;
+          }
+          if (busy) {
+            send('error', { message: 'engine is already processing an image', fatal: false }, jobId);
+            return;
+          }
+          busy = true;
+          try {
+            var t0 = performance.now();
+
+            progress('preprocess', null, 'decoding image');
+            // Decoded from a Blob rather than a data: URL: it skips a multi-megabyte
+            // string round-trip and does not depend on the fetch shim at all.
+            var image = await T.RawImage.fromBlob(
+              new Blob([b64decode(imageBase64)], { type: mimeType || 'image/jpeg' })
+            );
+
+            var inputs = await processor(image);
+            var t1 = performance.now();
+
+            progress('infer', null, 'running model');
+            var outputs = await model({ input: inputs.pixel_values });
+            var t2 = performance.now();
+
+            progress('compose', null, 'compositing');
+            var mask = await T.RawImage.fromTensor(outputs.output[0].mul(255).to('uint8')).resize(
+              image.width,
+              image.height
+            );
+            image.putAlpha(mask);
+
+            var canvas = document.createElement('canvas');
+            canvas.width = image.width;
+            canvas.height = image.height;
+            var ctx = canvas.getContext('2d');
+            var imageData = ctx.createImageData(image.width, image.height);
+            imageData.data.set(image.data);
+            ctx.putImageData(imageData, 0, 0);
+
+            var outWidth = canvas.width;
+            var outHeight = canvas.height;
+
+            var dataUrl = canvas.toDataURL('image/png');
+            var b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+
+            // Free the big intermediates before pushing several MB back across the bridge.
+            canvas.width = 0;
+            canvas.height = 0;
+            imageData = null;
+            image = null;
+            mask = null;
+            outputs = null;
+            inputs = null;
+
+            var total = Math.ceil(b64.length / RESULT_CHUNK) || 1;
+            for (var i = 0; i < total; i++) {
+              send('resultChunk', { index: i, total: total, data: b64.slice(i * RESULT_CHUNK, (i + 1) * RESULT_CHUNK) }, jobId);
+            }
+
+            send(
+              'result',
+              {
+                chunks: total,
+                width: outWidth,
+                height: outHeight,
+                size: currentSize,
+                inferenceMs: Math.round(t2 - t1),
+                totalMs: Math.round(performance.now() - t0),
+                backend: backend,
+              },
+              jobId
+            );
+          } catch (e) {
+            send('error', { message: 'inference failed: ' + (e && e.message ? e.message : e), fatal: false }, jobId);
+          } finally {
+            busy = false;
+          }
+        }
+
+        async function unload() {
+          try {
+            if (model && typeof model.dispose === 'function') await model.dispose();
+          } catch (e) {
+            log('dispose threw: ' + e.message);
+          }
+          model = null;
+          processor = null;
+          backend = null;
+          warmPromise = null;
+          byteCache.clear();
+        }
+
+        /* ----------------------------------------------------------------- *
+         * Inbound control channel
+         * ----------------------------------------------------------------- */
+
+        window.__BGONE_RECV = function (json) {
+          var msg;
+          try {
+            msg = JSON.parse(json);
+          } catch (e) {
+            fail('bad control message', false);
+            return;
+          }
+
+          switch (msg.type) {
+            case 'fileMeta':
+              onFileMeta(msg.payload);
+              break;
+            case 'fileError':
+              onFileError(msg.payload);
+              break;
+            case 'warm':
+              // warm() already reports its own failure; swallowing the rejection here
+              // stops it being reported a second time via onunhandledrejection.
+              warm(msg.payload || {}).catch(function () {});
+              break;
+            case 'setResolution':
+              setResolution(msg.payload.size).catch(function (e) {
+                fail('could not change resolution: ' + e.message, false);
+              });
+              break;
+            case 'process':
+              process(msg.id, msg.payload.imageBase64, msg.payload.mimeType);
+              break;
+            case 'ping':
+              send('pong', { busy: busy, hasModel: !!model }, msg.id);
+              break;
+            case 'unload':
+              unload().then(function () {
+                send('unloaded', {}, msg.id);
+              });
+              break;
+            default:
+              log('unknown message type: ' + msg.type);
+          }
+        };
+
+        /* ----------------------------------------------------------------- *
+         * Boot
+         * ----------------------------------------------------------------- */
+
+        // The listener above is installed synchronously, so by the time RN sees `ready`
+        // the page can already accept anything RN sends. No message can arrive early.
+        send('ready', {
+          userAgent: navigator.userAgent,
+          hasWebGPU: !!navigator.gpu,
+          secureContext: !!window.isSecureContext,
+          origin: location.origin,
+        });
+      })();
+    </script>
+  </body>
+</html>
