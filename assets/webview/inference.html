@@ -457,20 +457,20 @@
          * so any size the U-net can halve six times works. Keep it a multiple of 32.
          */
         function buildProcessor(size) {
-          return T.AutoProcessor.from_pretrained('briaai/RMBG-1.4', {
-            config: {
-              do_normalize: true,
-              do_pad: false,
-              do_rescale: true,
-              do_resize: true,
-              image_mean: [0.5, 0.5, 0.5],
-              feature_extractor_type: 'ImageFeatureExtractor',
-              image_std: [1, 1, 1],
-              resample: 2,
-              rescale_factor: 0.00392156862745098,
-              size: { width: size, height: size },
-            },
-            progress_callback: onProgressCallback,
+          // Constructed directly rather than through AutoProcessor.from_pretrained.
+          // That helper ignores an inline `config` and reads preprocessor_config.json
+          // from disk instead, which pins 1024 — so every size passed here used to be
+          // silently discarded and the resolution setting did nothing.
+          return new T.ImageFeatureExtractor({
+            do_normalize: true,
+            do_pad: false,
+            do_rescale: true,
+            do_resize: true,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [1, 1, 1],
+            resample: 2,
+            rescale_factor: 0.00392156862745098,
+            size: { width: size, height: size },
           });
         }
 
@@ -513,6 +513,207 @@
           var image = new T.RawImage(data, w, h, 3);
           var inputs = await processor(image);
           await model({ input: inputs.pixel_values });
+        }
+
+        /* ----------------------------------------------------------------- *
+         * CLIP — the second model
+         *
+         * Loaded lazily and independently of RMBG: a phone that only ever removes
+         * backgrounds never downloads a byte of it, and the image half (11 MB) can be
+         * used without ever pulling the text half (42 MB).
+         *
+         * The two config files are inlined rather than fetched. RN's file server keys
+         * on basename, and `config.json` / `preprocessor_config.json` would collide
+         * with RMBG's — the same trick the RMBG processor already uses.
+         *
+         * The preprocessing constants are copied verbatim from the repo's
+         * preprocessor_config.json. Note do_normalize:false — MobileCLIP takes raw
+         * [0,1] pixels with no mean/std. Getting this wrong produces embeddings that
+         * look fine and rank badly.
+         * ----------------------------------------------------------------- */
+
+        var CLIP_REPO = 'Xenova/mobileclip_s0';
+        var clipVision = null;
+        var clipProcessor = null;
+        var clipText = null;
+        var clipTokenizer = null;
+        var clipVisionPromise = null;
+        var clipTextPromise = null;
+
+        function clipDevice() {
+          return backend === 'webgpu' ? 'webgpu' : 'wasm';
+        }
+
+        function loadClipVision() {
+          if (clipVisionPromise) return clipVisionPromise;
+          clipVisionPromise = (async function () {
+            progress('compile', null, 'loading image encoder');
+            // fp32, not q8. The repo pins dtype.vision_model to fp32 and means it:
+            // this tower quantises badly and the damage is silent — well-formed
+            // vectors that rank nonsense. Costs 45 MB instead of 11.
+            var m = await T.CLIPVisionModelWithProjection.from_pretrained(CLIP_REPO, {
+              config: { model_type: 'clip' },
+              device: clipDevice(),
+              dtype: 'fp32',
+              progress_callback: onProgressCallback,
+            });
+            // Constructed directly, NOT via AutoProcessor.from_pretrained: that helper
+            // ignores an inline `config` and always fetches preprocessor_config.json
+            // (transformers.js 4.2.0 — `nt(id, 'preprocessor_config.json', true, opts)`
+            // never looks at opts.config). Since the file server keys on basename, the
+            // fetch would be answered with RMBG's config and the model would be handed
+            // 1024×1024 pixels when it wants 256×256.
+            var p = new T.CLIPImageProcessor({
+              crop_size: { height: 256, width: 256 },
+              do_center_crop: true,
+              do_convert_rgb: true,
+              do_normalize: false,
+              do_rescale: true,
+              do_resize: true,
+              resample: 2,
+              rescale_factor: 0.00392156862745098,
+              size: { shortest_edge: 256 },
+            });
+            clipVision = m;
+            clipProcessor = p;
+            // The session owns the weights now; the staging copy is dead weight.
+            byteCache.clear();
+            return m;
+          })();
+          clipVisionPromise.catch(function () {
+            clipVisionPromise = null;
+          });
+          return clipVisionPromise;
+        }
+
+        function loadClipText() {
+          if (clipTextPromise) return clipTextPromise;
+          clipTextPromise = (async function () {
+            progress('compile', null, 'loading text encoder');
+            var m = await T.CLIPTextModelWithProjection.from_pretrained(CLIP_REPO, {
+              config: { model_type: 'clip' },
+              device: clipDevice(),
+              dtype: 'q8',
+              progress_callback: onProgressCallback,
+            });
+            var tok = await T.AutoTokenizer.from_pretrained(CLIP_REPO, {
+              progress_callback: onProgressCallback,
+            });
+            clipText = m;
+            clipTokenizer = tok;
+            byteCache.clear();
+            return m;
+          })();
+          clipTextPromise.catch(function () {
+            clipTextPromise = null;
+          });
+          return clipTextPromise;
+        }
+
+        /**
+         * Tensor -> array of unit vectors.
+         *
+         * Normalising here, once, is what lets every consumer treat a dot product as a
+         * cosine similarity without having to remember to.
+         */
+        function toUnitVectors(tensor) {
+          var dims = tensor.dims;
+          var dim = dims[dims.length - 1];
+          var count = tensor.data.length / dim;
+          var out = [];
+          for (var i = 0; i < count; i++) {
+            var vec = new Array(dim);
+            var sum = 0;
+            for (var j = 0; j < dim; j++) {
+              var v = tensor.data[i * dim + j];
+              vec[j] = v;
+              sum += v * v;
+            }
+            var norm = Math.sqrt(sum) || 1;
+            for (var k = 0; k < dim; k++) vec[k] = vec[k] / norm;
+            out.push(vec);
+          }
+          return { vectors: out, dim: dim };
+        }
+
+        async function embedImage(jobId, imageBase64, mimeType) {
+          if (busy) {
+            send('error', { message: 'engine is already busy', fatal: false }, jobId);
+            return;
+          }
+          busy = true;
+          try {
+            var loadStart = performance.now();
+            var had = !!clipVision;
+            await loadClipVision();
+            var loadMs = had ? 0 : performance.now() - loadStart;
+
+            progress('preprocess', null, 'decoding image');
+            var image = await T.RawImage.fromBlob(
+              new Blob([b64decode(imageBase64)], { type: mimeType || 'image/jpeg' })
+            );
+            var inputs = await clipProcessor(image);
+
+            progress('infer', null, 'embedding image');
+            var t0 = performance.now();
+            var outputs = await clipVision(inputs);
+            var ms = performance.now() - t0;
+
+            var result = toUnitVectors(outputs.image_embeds);
+            image = null;
+            inputs = null;
+            outputs = null;
+
+            send(
+              'embedding',
+              { vectors: result.vectors, dim: result.dim, ms: Math.round(ms), loadMs: Math.round(loadMs) },
+              jobId
+            );
+          } catch (e) {
+            send('error', { message: 'image embedding failed: ' + (e && e.message ? e.message : e), fatal: false }, jobId);
+          } finally {
+            busy = false;
+          }
+        }
+
+        async function embedText(jobId, texts) {
+          if (busy) {
+            send('error', { message: 'engine is already busy', fatal: false }, jobId);
+            return;
+          }
+          busy = true;
+          try {
+            var loadStart = performance.now();
+            var had = !!clipText;
+            await loadClipText();
+            var loadMs = had ? 0 : performance.now() - loadStart;
+
+            progress('infer', null, 'embedding text');
+            // CLIP's text tower is trained at a fixed 77-token context; padding to it
+            // keeps every batch the same shape regardless of how short the query is.
+            var tokens = clipTokenizer(texts, {
+              padding: 'max_length',
+              max_length: 77,
+              truncation: true,
+            });
+            var t0 = performance.now();
+            var outputs = await clipText(tokens);
+            var ms = performance.now() - t0;
+
+            var result = toUnitVectors(outputs.text_embeds);
+            tokens = null;
+            outputs = null;
+
+            send(
+              'embedding',
+              { vectors: result.vectors, dim: result.dim, ms: Math.round(ms), loadMs: Math.round(loadMs) },
+              jobId
+            );
+          } catch (e) {
+            send('error', { message: 'text embedding failed: ' + (e && e.message ? e.message : e), fatal: false }, jobId);
+          } finally {
+            busy = false;
+          }
         }
 
         /** Raised to ask RN for a fresh page that skips WebGPU entirely. */
@@ -671,13 +872,22 @@
         }
 
         async function unload() {
-          try {
-            if (model && typeof model.dispose === 'function') await model.dispose();
-          } catch (e) {
-            log('dispose threw: ' + e.message);
+          var sessions = [model, clipVision, clipText];
+          for (var i = 0; i < sessions.length; i++) {
+            try {
+              if (sessions[i] && typeof sessions[i].dispose === 'function') await sessions[i].dispose();
+            } catch (e) {
+              log('dispose threw: ' + e.message);
+            }
           }
           model = null;
           processor = null;
+          clipVision = null;
+          clipProcessor = null;
+          clipText = null;
+          clipTokenizer = null;
+          clipVisionPromise = null;
+          clipTextPromise = null;
           backend = null;
           warmPromise = null;
           byteCache.clear();
@@ -715,6 +925,12 @@
               break;
             case 'process':
               process(msg.id, msg.payload.imageBase64, msg.payload.mimeType);
+              break;
+            case 'embedImage':
+              embedImage(msg.id, msg.payload.imageBase64, msg.payload.mimeType);
+              break;
+            case 'embedText':
+              embedText(msg.id, msg.payload.texts);
               break;
             case 'ping':
               send('pong', { busy: busy, hasModel: !!model }, msg.id);

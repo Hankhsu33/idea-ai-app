@@ -72,6 +72,49 @@ export async function pickFromCamera(): Promise<PickedImage | null> {
  * oversized PNGs into one predictable format, and the alpha channel of the input is
  * irrelevant because the model only reads RGB.
  */
+/**
+ * Shortest edge CLIP actually consumes.
+ *
+ * Its processor resizes the shortest edge to 256 and centre-crops to 256×256, so
+ * anything larger is thrown away after being paid for twice: once as base64 across the
+ * bridge, once as a decode in the page.
+ */
+export const EMBED_EDGE = 256;
+
+/**
+ * A saved cutout, shrunk to what the embedder needs.
+ *
+ * A full-size cutout PNG is a few MB, which becomes a few MB of base64 in a single
+ * `injectJavaScript` call — well past the size the chunked file transfer exists to
+ * avoid. At 256px the same image is tens of KB.
+ *
+ * Re-encoded as JPEG, so the transparent background becomes a flat colour. That is
+ * what CLIP sees, and it sees it identically for every cutout — which is what makes
+ * the vectors comparable.
+ */
+export async function prepareForEmbedding(uri: string, width: number, height: number): Promise<string> {
+  const context = ImageManipulator.manipulate(uri);
+
+  // Match the processor: it is the *shortest* edge that becomes 256.
+  if (Math.min(width, height) > EMBED_EDGE) {
+    if (width <= height) {
+      context.resize({ width: EMBED_EDGE });
+    } else {
+      context.resize({ height: EMBED_EDGE });
+    }
+  }
+
+  const rendered = await context.renderAsync();
+  const saved = await rendered.saveAsync({
+    format: SaveFormat.JPEG,
+    compress: 0.9,
+    base64: true,
+  });
+
+  if (!saved.base64) throw new Error('That image could not be read for tagging.');
+  return saved.base64;
+}
+
 export async function prepareForInference(image: PickedImage): Promise<PreparedImage> {
   const longest = Math.max(image.width, image.height);
   const context = ImageManipulator.manipulate(image.uri);

@@ -27,7 +27,7 @@ export default function GalleryScreen() {
               onPress={() =>
                 router.push({
                   pathname: '/gallery/[id]',
-                  params: { id: item.id, uri: item.uri },
+                  params: { id: item.id },
                 })
               }
               style={({ pressed }) => [

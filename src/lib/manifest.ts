@@ -112,8 +112,76 @@ export const MANAGED_FILES: ManagedFile[] = [
 
 export const TOTAL_EXPECTED_BYTES = MANAGED_FILES.reduce((n, f) => n + (f.expectedSize ?? 0), 0);
 
+/* ------------------------------------------------------------------ *
+ * CLIP — the second model
+ * ------------------------------------------------------------------ */
+
+export const CLIP_REPO = 'Xenova/mobileclip_s0';
+
+/** Pinned for the same reason as the RMBG revision: the byte sizes are the check. */
+export const CLIP_REVISION = '757d59c9c6870a76a4b0306f05f5061bca15c39f';
+
+const CLIP = `https://huggingface.co/${CLIP_REPO}/resolve/${CLIP_REVISION}/`;
+
+/**
+ * Deliberately NOT part of `MANAGED_FILES`.
+ *
+ * `MANAGED_FILES` is the set the engine refuses to warm without, and background removal
+ * must keep working on a phone that has never asked for a tag. These are fetched on
+ * first use through the same `ensureFile` path an unpinned file would take — the only
+ * difference is that being listed here gives them an exact size to verify against.
+ *
+ * Only three files cross the wire. CLIP's `config.json` and `preprocessor_config.json`
+ * share a basename with RMBG's, and the file server keys on basename — so those two are
+ * passed inline by the page instead, exactly as the RMBG processor recipe already is.
+ */
+export const CLIP_FILES: ManagedFile[] = [
+  {
+    /**
+     * Full precision, not the 11 MB 8-bit export.
+     *
+     * The repo's own config asks for it — `transformers.js_config.dtype.vision_model`
+     * is pinned to fp32 — and that is not a stylistic preference. MobileCLIP-S0's
+     * image tower is a hybrid convolution/transformer design, and quantising it to
+     * int8 does not fail loudly: it returns 512 perfectly well-formed numbers that
+     * rank nonsense. A selfie came back as "a full body shot of a plant".
+     *
+     * The text tower has no such pin and stays 8-bit.
+     */
+    name: 'vision_model.onnx',
+    url: `${CLIP}onnx/vision_model.onnx`,
+    expectedSize: 45543630,
+    minSize: 40000000,
+    label: 'MobileCLIP image encoder',
+  },
+  {
+    name: 'text_model_quantized.onnx',
+    url: `${CLIP}onnx/text_model_quantized.onnx`,
+    expectedSize: 42799238,
+    minSize: 38000000,
+    label: 'MobileCLIP text encoder (8-bit)',
+  },
+  {
+    name: 'tokenizer.json',
+    url: `${CLIP}tokenizer.json`,
+    expectedSize: 2224081,
+    minSize: 1000000,
+    label: 'CLIP tokenizer',
+  },
+  {
+    name: 'tokenizer_config.json',
+    url: `${CLIP}tokenizer_config.json`,
+    expectedSize: 763,
+    minSize: 100,
+    label: 'CLIP tokenizer config',
+  },
+];
+
+/** What a phone downloads the first time it tags an image, if nothing is cached yet. */
+export const CLIP_EXPECTED_BYTES = CLIP_FILES.reduce((n, f) => n + (f.expectedSize ?? 0), 0);
+
 export function findManagedFile(name: string): ManagedFile | undefined {
-  return MANAGED_FILES.find((f) => f.name === name);
+  return MANAGED_FILES.find((f) => f.name === name) ?? CLIP_FILES.find((f) => f.name === name);
 }
 
 /**

@@ -38,6 +38,13 @@ export type ToPageMessage =
   | { id: string; type: 'setResolution'; payload: { size: Resolution } }
   /** Run background removal. `id` is the job id the reply must echo. */
   | { id: string; type: 'process'; payload: { imageBase64: string; mimeType: string } }
+  /**
+   * Embed one image with CLIP. Loads the image encoder on first use — background
+   * removal never pays for it.
+   */
+  | { id: string; type: 'embedImage'; payload: { imageBase64: string; mimeType: string } }
+  /** Embed one or more short strings with CLIP. Loads the text encoder on first use. */
+  | { id: string; type: 'embedText'; payload: { texts: string[] } }
   /** Liveness check. */
   | { id: string; type: 'ping' }
   /** Drop the session so the model files can be deleted. */
@@ -70,6 +77,20 @@ export interface ResultPayload {
   backend: Backend;
 }
 
+export interface EmbeddingPayload {
+  /**
+   * One L2-normalised vector per input, so a cosine similarity is a plain dot product.
+   * Normalising in the page keeps every consumer on the RN side honest about it.
+   */
+  vectors: number[][];
+  /** Length of each vector. MobileCLIP-S0 projects to 512. */
+  dim: number;
+  /** Forward pass only. */
+  ms: number;
+  /** Time spent loading the encoder, non-zero only on the call that loaded it. */
+  loadMs: number;
+}
+
 export type FromPageMessage =
   /** Page JS booted and its listeners are installed. */
   | {
@@ -95,6 +116,8 @@ export type FromPageMessage =
   | { id: string; type: 'needsWasmRestart'; payload: { reason: string } }
   | { id: string; type: 'resultChunk'; payload: { index: number; total: number; data: string } }
   | { id: string; type: 'result'; payload: ResultPayload }
+  /** Reply to `embedImage` / `embedText`. Small enough to never need chunking. */
+  | { id: string; type: 'embedding'; payload: EmbeddingPayload }
   | { id: string; type: 'pong'; payload: { busy: boolean; hasModel: boolean } }
   | { id: string; type: 'unloaded'; payload: Record<string, never> }
   | { id: string; type: 'error'; payload: { message: string; fatal: boolean } }
@@ -186,4 +209,26 @@ export interface GalleryItem {
   height: number;
   inferenceMs: number;
   backend: Backend;
+  /**
+   * L2-normalised CLIP image embedding, present once the item has been tagged.
+   *
+   * Stored on the item rather than in a side index so it cannot drift away from the
+   * file it describes. 512 floats is a few KB of JSON — fine for a gallery of this
+   * size, and the first thing to reconsider if the index ever grows into thousands.
+   */
+  embedding?: number[];
+  /**
+   * Human-readable labels derived from `embedding`, best first.
+   *
+   * Stored rather than derived on read: naming a vector needs the 42 MB text encoder,
+   * and a gallery should not have to load a model to draw a chip.
+   */
+  tags?: string[];
+  /**
+   * One assembled sentence about the picture.
+   *
+   * Not generated — CLIP has no decoder. Several narrow questions are scored against
+   * the same vector and the confident answers are templated together.
+   */
+  caption?: string;
 }

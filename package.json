@@ -5,6 +5,7 @@
   "scripts": {
     "start": "expo start",
     "android": "expo start --android",
+    "check-engine": "node scripts/check-engine.mjs",
     "ios": "expo start --ios",
     "web": "expo start --web"
   },

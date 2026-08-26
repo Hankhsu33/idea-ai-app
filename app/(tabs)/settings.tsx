@@ -2,6 +2,7 @@ import { useFocusEffect } from 'expo-router';
 import { useCallback } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import ClipProbe from '@/components/ClipProbe';
 import { useEngine } from '@/src/lib/engine';
 
 export default function SettingsScreen() {
@@ -74,6 +75,8 @@ export default function SettingsScreen() {
           </>
         )}
       </View>
+
+      <ClipProbe />
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Gallery</Text>

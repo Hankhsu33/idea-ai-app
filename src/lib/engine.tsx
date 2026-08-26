@@ -20,6 +20,7 @@ import { RESOLUTIONS } from './types';
 import type {
   Backend,
   DownloadProgressSnapshot,
+  EmbeddingPayload,
   EngineError,
   EngineState,
   FromPageMessage,
@@ -45,6 +46,16 @@ const CHUNK_SIZE = 1024 * 1024;
 
 /** Hard ceiling on a single background removal before the engine is restarted. */
 const PROCESS_TIMEOUT_MS = 30_000;
+
+/**
+ * Ceiling on a single embedding.
+ *
+ * Far more generous than `PROCESS_TIMEOUT_MS` because the first call of each kind also
+ * downloads and compiles an encoder — 11 MB for images, 42 MB for text — over the same
+ * chunked bridge the model files use. Re-armed on every sign of life, so a slow link
+ * extends it rather than tripping it.
+ */
+const EMBED_TIMEOUT_MS = 180_000;
 
 /** How long the page may go completely silent during start-up before we give up. */
 const WARM_SILENCE_TIMEOUT_MS = 60_000;
@@ -84,6 +95,15 @@ export interface EngineContextValue {
   resolution: Resolution;
 
   process(imageBase64: string, mimeType: string): Promise<ProcessResult>;
+  /**
+   * One unit-length CLIP vector describing what is in the image.
+   *
+   * Loads the image encoder on first use, so the very first call is slow and every
+   * later one is not.
+   */
+  embedImage(imageBase64: string, mimeType: string): Promise<EmbeddingPayload>;
+  /** One unit-length CLIP vector per string. Dot it with an image vector to compare. */
+  embedText(texts: string[]): Promise<EmbeddingPayload>;
   setResolution(size: Resolution): void;
   startDownload(): void;
   cancelDownload(): void;
@@ -114,6 +134,22 @@ interface Job {
   onTimeout: () => void;
   chunks: (string | undefined)[];
   resolve(result: ProcessResult): void;
+  reject(error: Error): void;
+}
+
+/**
+ * An embedding job.
+ *
+ * Deliberately not folded into `Job`: the reply is a few KB of JSON rather than a
+ * chunked PNG, and a failed embedding must never put the engine into
+ * `inference_failed` — the cutout the user is looking at is still perfectly good.
+ */
+interface EmbedJob {
+  id: string;
+  settled: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  onTimeout: () => void;
+  resolve(payload: EmbeddingPayload): void;
   reject(error: Error): void;
 }
 
@@ -167,6 +203,7 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
   const webKeyRef = useRef(0);
   const pageReadyRef = useRef(false);
   const jobRef = useRef<Job | null>(null);
+  const embedJobRef = useRef<EmbedJob | null>(null);
   const busyRef = useRef(false);
   const jobSeq = useRef(0);
   const pingSeq = useRef(0);
@@ -297,6 +334,24 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const settleEmbed = useCallback(
+    (job: EmbedJob, outcome: { ok: true; value: EmbeddingPayload } | { ok: false; error: Error }) => {
+      if (job.settled) return;
+      job.settled = true;
+      if (job.timer) clearTimeout(job.timer);
+      job.timer = null;
+      if (embedJobRef.current === job) embedJobRef.current = null;
+      busyRef.current = false;
+
+      if (outcome.ok) {
+        job.resolve(outcome.value);
+      } else {
+        job.reject(outcome.error);
+      }
+    },
+    []
+  );
+
   /* ------------------------------------------------------------------ *
    * Restart
    * ------------------------------------------------------------------ */
@@ -317,6 +372,10 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       const job = jobRef.current;
       if (job) {
         settleJob(job, { ok: false, error: new Error(userFacing ?? 'The engine restarted.') });
+      }
+      const embedJob = embedJobRef.current;
+      if (embedJob) {
+        settleEmbed(embedJob, { ok: false, error: new Error(userFacing ?? 'The engine restarted.') });
       }
       busyRef.current = false;
 
@@ -348,7 +407,15 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
         armWarmWatchdog();
       }
     },
-    [armWarmWatchdog, clearWarmWatchdog, remountWebView, setState, settleJob, showNotice]
+    [
+      armWarmWatchdog,
+      clearWarmWatchdog,
+      remountWebView,
+      setState,
+      settleEmbed,
+      settleJob,
+      showNotice,
+    ]
   );
 
   restartEngineRef.current = restartEngine;
@@ -527,6 +594,27 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
           if (message.payload.stage === 'infer' && stateRef.current === 'initializing') {
             setState('warming');
           }
+          // The first embedding of each kind spends most of its time pulling an encoder
+          // across the bridge. That is work, not silence — keep pushing the deadline out.
+          const embedJob = embedJobRef.current;
+          if (embedJob && !embedJob.settled && embedJob.timer) {
+            clearTimeout(embedJob.timer);
+            embedJob.timer = setTimeout(embedJob.onTimeout, EMBED_TIMEOUT_MS);
+          }
+          break;
+        }
+
+        case 'embedding': {
+          const job = embedJobRef.current;
+          if (!job || job.id !== message.id || job.settled) return;
+
+          console.log(
+            `[bgone] embedding · ${message.payload.vectors.length}×${message.payload.dim} · ${message.payload.ms} ms` +
+              (message.payload.loadMs ? ` (encoder loaded in ${message.payload.loadMs} ms)` : '')
+          );
+          settleEmbed(job, { ok: true, value: message.payload });
+          setProgress(null);
+          setState('ready');
           break;
         }
 
@@ -636,12 +724,26 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
             return;
           }
 
+          // A failed embedding is not an engine failure: the cutout the user is looking
+          // at is still fine, and background removal is untouched. Hand the error to
+          // the caller and stay `ready`.
+          const embedJob = embedJobRef.current;
+          if (embedJob && embedJob.id === message.id) {
+            settleEmbed(embedJob, { ok: false, error: new Error(text) });
+            setProgress(null);
+            setState('ready');
+            return;
+          }
+
           if (fatal) {
             clearWarmWatchdog();
             // A fatal page error is not going to produce a result, so do not leave a
             // job (and busyRef) pending until its watchdog eventually notices.
             if (job) {
               settleJob(job, { ok: false, error: new Error('The engine stopped unexpectedly.') });
+            }
+            if (embedJob) {
+              settleEmbed(embedJob, { ok: false, error: new Error('The engine stopped unexpectedly.') });
             }
             setProgress(null);
             setState('engine_failed');
@@ -664,6 +766,7 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       sendPing,
       serveFile,
       setState,
+      settleEmbed,
       settleJob,
     ]
   );
@@ -809,6 +912,80 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       });
     },
     [post, setState, settleJob]
+  );
+
+  /**
+   * Shared body of `embedImage` / `embedText`.
+   *
+   * Takes the same `busyRef` lock a cutout does, so the two can never overlap inside a
+   * page that only has one session's worth of memory to spare.
+   */
+  const runEmbed = useCallback(
+    (id: string, send: () => void): Promise<EmbeddingPayload> => {
+      if (busyRef.current) {
+        return Promise.reject(new Error('Already working on an image.'));
+      }
+      if (stateRef.current !== 'ready') {
+        return Promise.reject(new Error(notReadyMessage(stateRef.current)));
+      }
+
+      busyRef.current = true;
+
+      if (pendingPingRef.current) {
+        clearTimeout(pendingPingRef.current.timer);
+        pendingPingRef.current = null;
+      }
+
+      setState('processing');
+      setProgress({ stage: 'preprocess', ratio: null, detail: 'starting' });
+
+      return new Promise<EmbeddingPayload>((resolve, reject) => {
+        const job: EmbedJob = {
+          id,
+          settled: false,
+          timer: null,
+          onTimeout: () => {},
+          resolve,
+          reject,
+        };
+        embedJobRef.current = job;
+
+        job.onTimeout = () => {
+          if (job.settled) return;
+          settleEmbed(job, { ok: false, error: new Error('Tagging took too long. Try again.') });
+          setProgress(null);
+          // No `inference_timeout`: background removal is unaffected and the page is
+          // very likely still healthy. A ping confirms it without a restart.
+          setState('ready');
+          sendPing();
+        };
+
+        job.timer = setTimeout(job.onTimeout, EMBED_TIMEOUT_MS);
+        send();
+      });
+    },
+    [sendPing, setState, settleEmbed]
+  );
+
+  const embedImage = useCallback(
+    (imageBase64: string, mimeType: string): Promise<EmbeddingPayload> => {
+      const id = `e${++jobSeq.current}`;
+      return runEmbed(id, () =>
+        post({ id, type: 'embedImage', payload: { imageBase64, mimeType } })
+      );
+    },
+    [post, runEmbed]
+  );
+
+  const embedText = useCallback(
+    (texts: string[]): Promise<EmbeddingPayload> => {
+      if (!texts.length) {
+        return Promise.reject(new Error('Nothing to embed.'));
+      }
+      const id = `e${++jobSeq.current}`;
+      return runEmbed(id, () => post({ id, type: 'embedText', payload: { texts } }));
+    },
+    [post, runEmbed]
   );
 
   const retry = useCallback(() => {
@@ -1011,6 +1188,8 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       notice,
       resolution,
       process,
+      embedImage,
+      embedText,
       setResolution,
       startDownload,
       cancelDownload,
@@ -1031,6 +1210,8 @@ export function EngineProvider({ children }: { children: React.ReactNode }) {
       notice,
       resolution,
       process,
+      embedImage,
+      embedText,
       setResolution,
       startDownload,
       cancelDownload,

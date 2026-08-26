@@ -12,27 +12,37 @@ import {
 
 import CheckerboardPreview from '@/components/CheckerboardPreview';
 import { useGalleryPhotos } from '@/components/GalleryPhotosContext';
-import { useEngine } from '@/src/lib/engine';
+import TagChips from '@/components/TagChips';
+import { useEngine, type ProcessResult } from '@/src/lib/engine';
 import { prepareForInference, type PickedImage } from '@/src/lib/imagePrep';
+import { describeImage } from '@/src/lib/tags';
 
 export default function CreateScreen() {
   const engine = useEngine();
-  const { addPhoto } = useGalleryPhotos();
+  const { addPhoto, updatePhoto } = useGalleryPhotos();
   const [pickedImage, setPickedImage] = useState<PickedImage | null>(null);
+  const [galleryPhotoId, setGalleryPhotoId] = useState<string | null>(null);
   const [resultUri, setResultUri] = useState<string | null>(null);
+  const [tags, setTags] = useState<string[] | null>(null);
+  const [caption, setCaption] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [processing, setProcessing] = useState(false);
+  const [tagging, setTagging] = useState(false);
   const runningRef = useRef(false);
+
+  const busy = processing || tagging;
   const engineStatusLabel = processing
     ? null
-    : engine.modelStatus === null
-      ? 'checking model status…'
-      : engine.modelStatus.phase !== 'ready'
-        ? 'model not downloaded — go to Settings'
-        : engine.state !== 'ready'
-          ? 'engine warming up…'
-          : null;
-  const removeDisabled = processing || engineStatusLabel !== null;
+    : tagging
+      ? 'describing photo...'
+      : engine.modelStatus === null
+        ? 'checking model status...'
+        : engine.modelStatus.phase !== 'ready'
+          ? 'model not downloaded - go to Settings'
+          : engine.state !== 'ready'
+            ? 'engine warming up...'
+            : null;
+  const removeDisabled = busy || engineStatusLabel !== null;
 
   const pickImage = async () => {
     try {
@@ -57,10 +67,13 @@ export default function CreateScreen() {
           width: selectedImage.width,
           height: selectedImage.height,
         };
+        const photoId = addPhoto(picked);
 
         setPickedImage(picked);
+        setGalleryPhotoId(photoId);
         setResultUri(null);
-        addPhoto(selectedImage.uri);
+        setTags(null);
+        setCaption(null);
       }
     } catch {
       setMessage("We couldn't open your photo library. Please try again.");
@@ -92,17 +105,51 @@ export default function CreateScreen() {
     setProcessing(true);
     setMessage(null);
     setResultUri(null);
+    setTags(null);
+    setCaption(null);
+
+    let outcome: ProcessResult | null = null;
 
     try {
       const prepared = await prepareForInference(pickedImage);
-      const result = await engine.process(prepared.base64, prepared.mimeType);
+      outcome = await engine.process(prepared.base64, prepared.mimeType);
+      const uri = `data:image/png;base64,${outcome.pngBase64}`;
 
-      setResultUri(`data:image/png;base64,${result.pngBase64}`);
+      setResultUri(uri);
+      if (galleryPhotoId) {
+        updatePhoto(galleryPhotoId, {
+          uri,
+          width: outcome.width,
+          height: outcome.height,
+          inferenceMs: outcome.inferenceMs,
+        });
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'The background could not be removed.');
     } finally {
-      runningRef.current = false;
       setProcessing(false);
+    }
+
+    if (!outcome) {
+      runningRef.current = false;
+      return;
+    }
+
+    setTagging(true);
+    try {
+      const description = await describeImage(engine, pickedImage);
+
+      setTags(description.tags);
+      setCaption(description.caption);
+      if (galleryPhotoId) {
+        updatePhoto(galleryPhotoId, description);
+      }
+    } catch (error) {
+      console.warn('[my-app] photo description failed', error);
+      setMessage('The background was removed, but the photo description could not finish.');
+    } finally {
+      setTagging(false);
+      runningRef.current = false;
     }
   };
 
@@ -111,19 +158,20 @@ export default function CreateScreen() {
       <Text style={styles.title}>Create</Text>
       <Pressable
         accessibilityRole="button"
-        disabled={processing}
+        accessibilityState={{ disabled: busy }}
+        disabled={busy}
         onPress={pickImage}
         style={({ pressed }) => [
           styles.button,
-          processing && styles.buttonDisabled,
-          pressed && !processing && styles.buttonPressed,
+          busy && styles.buttonDisabled,
+          pressed && !busy && styles.buttonPressed,
         ]}>
         <Text style={styles.buttonText}>Choose a Photo</Text>
       </Pressable>
 
-      {message && <Text style={styles.message}>{message}</Text>}
+      {message ? <Text style={styles.message}>{message}</Text> : null}
 
-      {pickedImage && (
+      {pickedImage ? (
         <>
           <Image source={{ uri: pickedImage.uri }} style={styles.image} resizeMode="contain" />
           <Pressable
@@ -139,35 +187,36 @@ export default function CreateScreen() {
             {processing ? (
               <View style={styles.processingRow}>
                 <ActivityIndicator color="#FFFFFF" />
-                <Text style={styles.buttonText}>Removing background…</Text>
+                <Text style={styles.buttonText}>Removing background...</Text>
               </View>
             ) : (
               <Text style={styles.buttonText}>Remove background</Text>
             )}
           </Pressable>
-          {engineStatusLabel && <Text style={styles.engineStatus}>{engineStatusLabel}</Text>}
+          {engineStatusLabel ? <Text style={styles.engineStatus}>{engineStatusLabel}</Text> : null}
         </>
-      )}
+      ) : null}
 
-      {processing && (
+      {processing ? (
         <Text style={styles.processingText}>
-          Working on your photo — this usually takes about 8 seconds.
+          Working on your photo - this usually takes about 8 seconds.
         </Text>
-      )}
+      ) : null}
 
-      {resultUri && (
+      {resultUri ? (
         <View style={styles.resultSection}>
           <Text style={styles.resultTitle}>Result</Text>
           <View style={styles.resultPreview}>
             <CheckerboardPreview uri={resultUri} />
           </View>
-          {engine.lastInferenceMs !== null && (
+          <TagChips tags={tags} caption={caption} pending={tagging} />
+          {engine.lastInferenceMs !== null ? (
             <Text style={styles.inferenceTime}>
               Last inference: {Math.round(engine.lastInferenceMs)} ms
             </Text>
-          )}
+          ) : null}
         </View>
-      )}
+      ) : null}
     </ScrollView>
   );
 }
@@ -258,6 +307,7 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 360,
     alignItems: 'center',
+    gap: 14,
     marginTop: 30,
   },
   resultTitle: {
@@ -265,7 +315,6 @@ const styles = StyleSheet.create({
     color: '#831843',
     fontSize: 22,
     fontWeight: '700',
-    marginBottom: 12,
   },
   resultPreview: {
     width: '100%',
@@ -273,6 +322,5 @@ const styles = StyleSheet.create({
   inferenceTime: {
     color: '#6B7280',
     fontSize: 14,
-    marginTop: 10,
   },
 });

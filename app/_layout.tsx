@@ -6,6 +6,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 
+import { GalleryPhotosProvider } from '@/components/GalleryPhotosContext';
 import { useColorScheme } from '@/components/useColorScheme';
 import { EngineProvider } from '@/src/lib/engine';
 
@@ -44,7 +45,9 @@ export default function RootLayout() {
 
   return (
     <EngineProvider>
-      <RootLayoutNav />
+      <GalleryPhotosProvider>
+        <RootLayoutNav />
+      </GalleryPhotosProvider>
     </EngineProvider>
   );
 }
